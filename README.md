@@ -219,7 +219,3 @@ The production deployment uses two cloud providers:
 
 - **AWS EC2** — Hosts the entire application stack (Flask backend, PostgreSQL, Redis, and Nginx-served React frontend) via Docker Compose on a Linux instance.
 - **GCP — Google AI Studio** — Provides the Gemini API used to generate AI responses, analogies, and examples in real time during class sessions.
-
-## License
-
-MIT
