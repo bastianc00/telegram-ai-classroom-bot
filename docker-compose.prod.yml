@@ -1,0 +1,99 @@
+
+services:
+  # Base de datos PostgreSQL
+  db:
+    image: postgres:15-alpine
+    container_name: pds_postgres
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - pds_network
+
+  # Redis para sincronización de WebSocket entre workers
+  redis:
+    image: redis:7-alpine
+    container_name: pds_redis
+    restart: always
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - pds_network
+
+  # Backend Flask API
+  backend:
+    build: ./backend
+    container_name: pds_backend
+    restart: always
+    environment:
+      - PYTHONUNBUFFERED=1
+      - SECRET_KEY=${SECRET_KEY}
+      - FLASK_ENV=production
+      - HOST=0.0.0.0
+      - PORT=5000
+      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      - REDIS_URL=redis://redis:6379/0
+      - FIREBASE_CREDENTIALS_PATH=${FIREBASE_CREDENTIALS_PATH}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_WEBHOOK_SECRET=${TELEGRAM_WEBHOOK_SECRET}
+      - TELEGRAM_WEBHOOK_URL=${TELEGRAM_WEBHOOK_URL}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - API_BASE_URL=http://backend:5000/api
+      - CORS_ORIGINS=${CORS_ORIGINS}
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./backend/static:/app/static
+      - ./backend/uploads:/app/uploads
+      - ${FIREBASE_CREDENTIALS_FILE}:/app/${FIREBASE_CREDENTIALS_PATH}:ro
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - pds_network
+
+  # Frontend React + Vite (servido por Nginx)
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        - VITE_API_URL=${VITE_API_URL}
+        - VITE_FIREBASE_API_KEY=${VITE_FIREBASE_API_KEY}
+        - VITE_FIREBASE_AUTH_DOMAIN=${VITE_FIREBASE_AUTH_DOMAIN}
+        - VITE_FIREBASE_PROJECT_ID=${VITE_FIREBASE_PROJECT_ID}
+        - VITE_FIREBASE_STORAGE_BUCKET=${VITE_FIREBASE_STORAGE_BUCKET}
+        - VITE_FIREBASE_MESSAGING_SENDER_ID=${VITE_FIREBASE_MESSAGING_SENDER_ID}
+        - VITE_FIREBASE_APP_ID=${VITE_FIREBASE_APP_ID}
+    container_name: pds_frontend
+    restart: always
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    networks:
+      - pds_network
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  pds_network:
+    driver: bridge

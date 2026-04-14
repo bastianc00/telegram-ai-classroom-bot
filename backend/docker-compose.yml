@@ -1,0 +1,67 @@
+services:
+  # Base de datos PostgreSQL
+  db:
+    image: postgres:15-alpine
+    container_name: pds_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-teacher_assistant_db}
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-teacher_assistant_db}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # Backend Flask (con Bot integrado vía webhook)
+  backend:
+    build: .
+    container_name: pds_backend
+    environment:
+      - SECRET_KEY=${SECRET_KEY:-dev-secret-key-change-in-production}
+      - FLASK_ENV=${FLASK_ENV:-development}
+      - HOST=0.0.0.0
+      - PORT=5000
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-teacher_assistant_db}
+      - FIREBASE_CREDENTIALS_PATH=${FIREBASE_CREDENTIALS_PATH:-./chatbotpdsp3-firebase-adminsdk-fbsvc-93426df3b9.json}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_WEBHOOK_SECRET=${TELEGRAM_WEBHOOK_SECRET:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - API_BASE_URL=http://backend:5000/api
+      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:5173,http://localhost:3000,http://localhost:80,http://172.28.255.178:5173}
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./static:/app/static
+      - ./uploads:/app/uploads
+      - ./chatbotpdsp3-firebase-adminsdk-fbsvc-93426df3b9.json:/app/chatbotpdsp3-firebase-adminsdk-fbsvc-93426df3b9.json:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Bot de Telegram (MODO POLLING - Solo para desarrollo local)
+  # En producción usa WEBHOOKS desde el backend
+  telegram_bot_dev:
+    build: .
+    container_name: pds_telegram_bot_dev
+    command: python -m app.services.telegram_bot
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - API_BASE_URL=http://backend:5000/api
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-teacher_assistant_db}
+    depends_on:
+      backend:
+        condition: service_started
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

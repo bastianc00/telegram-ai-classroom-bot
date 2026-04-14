@@ -1,0 +1,98 @@
+
+services:
+  # Base de datos PostgreSQL
+  db:
+    image: postgres:15-alpine
+    container_name: pds_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-teacher_assistant_db}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d teacher_assistant_db"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - pds_network
+
+  # Backend Flask API
+  backend:
+    build: ./backend
+    container_name: pds_backend
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1
+      - SECRET_KEY=${SECRET_KEY:-dev-secret-key-change-in-production}
+      - FLASK_ENV=${FLASK_ENV:-development}
+      - HOST=0.0.0.0
+      - PORT=5000
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-teacher_assistant_db}
+      - FIREBASE_CREDENTIALS_PATH=${FIREBASE_CREDENTIALS_PATH:-./chatbotpdsp3-firebase-adminsdk-fbsvc-93426df3b9.json}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_WEBHOOK_SECRET=${TELEGRAM_WEBHOOK_SECRET:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - API_BASE_URL=http://backend:5000/api
+      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost,http://localhost:80,http://localhost:3000,http://localhost:5173}
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./backend/static:/app/static
+      - ./backend/uploads:/app/uploads
+      - ./backend/chatbotpdsp3-firebase-adminsdk-fbsvc-93426df3b9.json:/app/chatbotpdsp3-firebase-adminsdk-fbsvc-93426df3b9.json:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - pds_network
+
+  # Bot de Telegram (MODO WEBHOOK - No requiere proceso separado)
+  # El bot se maneja vía webhook desde el backend Flask
+  # Para desarrollo local con polling, descomentar la sección abajo:
+  #
+  # telegram_bot_dev:
+  #   build: ./backend
+  #   container_name: pds_telegram_bot_dev
+  #   restart: unless-stopped
+  #   command: python /app/app/services/telegram_bot.py
+  #   environment:
+  #     - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+  #     - API_BASE_URL=http://backend:5000/api
+  #     - GEMINI_API_KEY=${GEMINI_API_KEY}
+  #   depends_on:
+  #     - backend
+  #   networks:
+  #     - pds_network
+
+  # Frontend React + Vite
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        - VITE_API_URL=${VITE_API_URL:-http://localhost:5000}
+        - VITE_FIREBASE_API_KEY=${VITE_FIREBASE_API_KEY}
+        - VITE_FIREBASE_AUTH_DOMAIN=${VITE_FIREBASE_AUTH_DOMAIN}
+        - VITE_FIREBASE_PROJECT_ID=${VITE_FIREBASE_PROJECT_ID}
+        - VITE_FIREBASE_STORAGE_BUCKET=${VITE_FIREBASE_STORAGE_BUCKET}
+        - VITE_FIREBASE_MESSAGING_SENDER_ID=${VITE_FIREBASE_MESSAGING_SENDER_ID}
+        - VITE_FIREBASE_APP_ID=${VITE_FIREBASE_APP_ID}
+    container_name: pds_frontend
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    networks:
+      - pds_network
+
+volumes:
+  postgres_data:
+
+networks:
+  pds_network:
+    driver: bridge

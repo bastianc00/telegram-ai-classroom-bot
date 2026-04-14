@@ -1,0 +1,91 @@
+
+# Archivos env
+.env
+.env.local
+.env.*.local
+.env.production
+.envrc
+
+# Archivos env de respaldo
+*.env.save
+.env.save
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+venv/
+env/
+*.pyc
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# Frontend
+node_modules/
+dist/
+build/
+.next/
+out/
+.vscode/
+
+# Firebase service account keys (NUNCA subir al repositorio)
+firebase-credentials.json
+*-credentials.json
+firebase-service-account.json
+*-firebase-adminsdk-*.json
+*-adminsdk-*.json
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Backend static files
+backend/static/uploads/*
+backend/static/presentations/*
+!backend/static/uploads/.gitkeep
+!backend/static/presentations/.gitkeep
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+*.swp
+*.swo
+*~
+
+# Claude Code local settings
+.claude/
+
+# Archivos de Office (no ignorar ejemplos de prueba)
+# *.docx
+# *.pptx
+# *.xlsx
+
+# Docker
+postgres_data/
+
+# Uploads
+backend/uploads/*
+!backend/uploads/.gitkeep
+
+# Frontend build
+frontend/.vite/
+frontend/dist/
+
+# IMPORTANTE: NO subir archivos de Firebase a GitHub público
+pds-asistenteeducacional.pem
+*.sh

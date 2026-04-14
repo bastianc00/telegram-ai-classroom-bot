@@ -1,0 +1,886 @@
+"""
+Telegram Bot - Bot de control para presentaciones
+"""
+import os
+import requests
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Configuración
+BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+API_BASE_URL = os.getenv('API_BASE_URL', 'http://localhost:5000/api')
+
+# Estado del usuario (sync_code y message_id del control)
+user_sessions = {}
+control_messages = {}  # chat_id -> message_id del control
+pending_example_requests = {}  # chat_id -> {request_id, options}
+pending_question_requests = {}  # chat_id -> {request_id, options, question_type}
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /start - Inicia el bot"""
+    await update.message.reply_text(
+        "👋 ¡Bienvenido al Sistema de Control de Presentaciones!\n\n"
+        "Para conectar tu control:\n"
+        "1. Inicia una clase en la plataforma web\n"
+        "2. Usa el comando /sync CÓDIGO\n\n"
+        "Comandos disponibles:\n"
+        "/sync CODIGO - Sincronizar con presentación\n"
+        "/status - Ver estado de conexión\n"
+        "/ejemplo TEMA - Generar ejemplo con IA (texto o audio)\n"
+        "/pregunta - Generar pregunta con IA (solo texto)\n"
+        "/disconnect - Desconectar control\n\n"
+        "💡 Tip: Puedes enviar un audio de voz para generar ejemplos"
+    )
+
+
+async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /sync CODIGO - Sincroniza con una presentación"""
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+
+    # Verificar que se proporcionó el código
+    if not context.args or len(context.args) == 0:
+        await update.message.reply_text(
+            "❌ Debes proporcionar el código de sincronización.\n"
+            "Uso: /sync ABC123"
+        )
+        return
+
+    sync_code = context.args[0].upper()
+
+    # Llamar al API para sincronizar
+    try:
+        response = requests.post(
+            f"{API_BASE_URL}/sync/pair",
+            json={
+                'sync_code': sync_code,
+                'telegram_chat_id': str(chat_id),
+                'telegram_user_id': str(user_id)
+            }
+        )
+
+        if response.status_code == 200:
+            data = response.json()
+            
+            # Verificar si la instancia está activa desde la respuesta de pair
+            is_instance_active = data.get('is_instance_active', True)
+            
+            if not is_instance_active:
+                await update.message.reply_text(
+                    f"🔴 La clase ya ha finalizado\n\n"
+                    f"Esta presentación ya no está activa."
+                )
+                return
+            
+            # Guardar sesión
+            user_sessions[chat_id] = sync_code
+
+            await update.message.reply_text(
+                f"✅ ¡Sincronización exitosa!\n\n"
+                f"Código: {sync_code}\n"
+                f"Usa los botones para controlar la presentación."
+            )
+
+            # Enviar o actualizar teclado de control
+            await send_control_keyboard(update, chat_id)
+
+        else:
+            error_msg = response.json().get('error', 'Error desconocido')
+            await update.message.reply_text(
+                f"❌ Error al sincronizar: {error_msg}\n\n"
+                f"Verifica que el código sea correcto."
+            )
+
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Error de conexión: {str(e)}\n"
+            f"Verifica que el servidor esté funcionando."
+        )
+
+
+def get_control_keyboard():
+    """Retorna el teclado de control inline"""
+    keyboard = [
+        [
+            InlineKeyboardButton("⬅️ Anterior", callback_data="prev"),
+            InlineKeyboardButton("▶️ Siguiente", callback_data="next")
+        ],
+        [
+            InlineKeyboardButton("⏸️ Pausar", callback_data="pause"),
+            InlineKeyboardButton("▶️ Reanudar", callback_data="resume")
+        ],
+        [
+            InlineKeyboardButton("📊 Estado", callback_data="status")
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+async def send_control_keyboard(update: Update, chat_id: int):
+    """Envía o actualiza el teclado de control"""
+    reply_markup = get_control_keyboard()
+
+    # Si ya existe un mensaje de control, intentar eliminarlo
+    if chat_id in control_messages:
+        try:
+            await update.get_bot().delete_message(
+                chat_id=chat_id,
+                message_id=control_messages[chat_id]
+            )
+        except Exception as e:
+            print(f"No se pudo eliminar mensaje anterior: {e}")
+
+    # Enviar nuevo control
+    message = await update.message.reply_text(
+        "🎮 Control de Presentación:",
+        reply_markup=reply_markup
+    )
+
+    # Guardar el message_id
+    control_messages[chat_id] = message.message_id
+
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Maneja los botones del control"""
+    query = update.callback_query
+    await query.answer()
+
+    chat_id = update.effective_chat.id
+    command = query.data
+
+    # Manejar callbacks de ejemplos
+    if command.startswith('example_'):
+        await handle_example_callback(query, chat_id, command)
+        return
+
+    # Manejar callbacks de preguntas
+    if command.startswith('question_'):
+        await handle_question_callback(query, chat_id, command)
+        return
+
+    # Verificar si está sincronizado
+    if chat_id not in user_sessions:
+        await query.edit_message_text(
+            "❌ No estás sincronizado.\n"
+            "Usa /sync CODIGO para conectar."
+        )
+        return
+
+    sync_code = user_sessions[chat_id]
+
+    # Comando de estado
+    if command == "status":
+        try:
+            response = requests.get(f"{API_BASE_URL}/sync/{sync_code}/status")
+            if response.status_code == 200:
+                data = response.json()
+                sync_session = data.get('sync_session', {})
+                slide = sync_session.get('current_slide', 1)
+                is_connected = data.get('is_connected', False)
+                is_instance_active = data.get('is_instance_active', False)
+
+                status_text = (
+                    f"📊 Estado de la Presentación:\n\n"
+                    f"Código: {sync_code}\n"
+                    f"Conectado: {'✅ Sí' if is_connected else '❌ No'}\n"
+                    f"Estado: {'▶️ En curso' if is_instance_active else '🔴 Finalizada'}\n"
+                    f"Diapositiva actual: {slide}"
+                )
+
+                await query.edit_message_text(
+                    status_text,
+                    reply_markup=get_control_keyboard()
+                )
+            else:
+                await query.edit_message_text("❌ Error al obtener estado")
+        except Exception as e:
+            await query.edit_message_text(f"❌ Error: {str(e)}")
+        return
+
+    # Enviar comando
+    try:
+        response = requests.post(
+            f"{API_BASE_URL}/sync/{sync_code}/command",
+            json={'command': command}
+        )
+
+        if response.status_code == 400:
+            # La clase ya finalizó
+            error_data = response.json()
+            error_message = error_data.get('error', 'Error desconocido')
+
+            await query.edit_message_text(
+                f"🔴 {error_message}\n\n"
+                f"Esta presentación ya no está activa.\n"
+                f"Usa /disconnect para desconectar el control."
+            )
+            return
+
+        if response.status_code == 200:
+            data = response.json()
+            sync_session = data.get('sync_session', {})
+            slide = sync_session.get('current_slide', 1)
+
+            emoji_map = {
+                'next': '▶️',
+                'prev': '⬅️',
+                'pause': '⏸️',
+                'resume': '▶️'
+            }
+
+            new_text = (
+                f"{emoji_map.get(command, '✅')} Comando enviado: {command}\n"
+                f"Diapositiva actual: {slide}"
+            )
+
+            try:
+                await query.edit_message_text(
+                    new_text,
+                    reply_markup=get_control_keyboard()
+                )
+            except Exception as edit_error:
+                # Si falla por mensaje idéntico, ignorar el error
+                if "message is not modified" not in str(edit_error).lower():
+                    raise
+
+        else:
+            await query.edit_message_text(
+                f"❌ Error al enviar comando"
+            )
+
+    except Exception as e:
+        # Solo mostrar el error si no es por mensaje idéntico
+        if "message is not modified" not in str(e).lower():
+            await query.edit_message_text(
+                f"❌ Error de conexión: {str(e)}"
+            )
+
+
+async def disconnect_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /disconnect - Desconecta el control"""
+    chat_id = update.effective_chat.id
+
+    if chat_id not in user_sessions:
+        await update.message.reply_text("❌ No estás sincronizado.")
+        return
+
+    sync_code = user_sessions[chat_id]
+
+    try:
+        response = requests.post(f"{API_BASE_URL}/sync/{sync_code}/disconnect")
+
+        if response.status_code == 200:
+            del user_sessions[chat_id]
+
+            # Eliminar mensaje de control si existe
+            if chat_id in control_messages:
+                try:
+                    await update.get_bot().delete_message(
+                        chat_id=chat_id,
+                        message_id=control_messages[chat_id]
+                    )
+                    del control_messages[chat_id]
+                except Exception as e:
+                    print(f"No se pudo eliminar mensaje de control: {e}")
+
+            await update.message.reply_text("✅ Control desconectado exitosamente.")
+        else:
+            await update.message.reply_text("❌ Error al desconectar.")
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /status - Muestra el estado actual"""
+    chat_id = update.effective_chat.id
+
+    if chat_id not in user_sessions:
+        await update.message.reply_text(
+            "❌ No estás sincronizado.\n"
+            "Usa /sync CODIGO para conectar."
+        )
+        return
+
+    sync_code = user_sessions[chat_id]
+
+    try:
+        response = requests.get(f"{API_BASE_URL}/sync/{sync_code}/status")
+
+        if response.status_code == 200:
+            data = response.json()
+            sync_session = data.get('sync_session', {})
+            slide = sync_session.get('current_slide', 1)
+            is_connected = data.get('is_connected', False)
+            is_instance_active = data.get('is_instance_active', False)
+            last_command = sync_session.get('last_command', 'Ninguno')
+
+            await update.message.reply_text(
+                f"📊 Estado de la Presentación:\n\n"
+                f"Código: {sync_code}\n"
+                f"Conectado: {'✅ Sí' if is_connected else '❌ No'}\n"
+                f"Estado: {'▶️ En curso' if is_instance_active else '🔴 Finalizada'}\n"
+                f"Diapositiva actual: {slide}\n"
+                f"Último comando: {last_command}"
+            )
+        else:
+            await update.message.reply_text("❌ Error al obtener estado")
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
+
+async def handle_example_callback(query, chat_id: int, callback_data: str):
+    """Maneja las interacciones con los botones de ejemplos"""
+    if chat_id not in pending_example_requests:
+        await query.edit_message_text("❌ Solicitud expirada. Usa /ejemplo nuevamente.")
+        return
+
+    req_data = pending_example_requests[chat_id]
+    request_id = req_data['request_id']
+
+    # Seleccionar una opción
+    if callback_data.startswith('example_select_'):
+        option_index = int(callback_data.split('_')[2])
+
+        try:
+            # Informar que se está procesando
+            await query.edit_message_text("⏳ Generando diapositiva con el ejemplo seleccionado...")
+
+            # Enviar selección al backend
+            response = requests.post(
+                f"{API_BASE_URL}/example/{request_id}/select",
+                json={'option_index': option_index}
+            )
+
+            if response.status_code == 200:
+                data = response.json()
+                new_slide_index = data.get('new_slide_index')
+                total_slides = data.get('total_slides')
+
+                # Eliminar solicitud pendiente
+                del pending_example_requests[chat_id]
+
+                await query.edit_message_text(
+                    f"✅ ¡Ejemplo generado exitosamente!\n\n"
+                    f"📊 Nueva diapositiva creada en posición {new_slide_index}\n"
+                    f"Total de diapositivas: {total_slides}\n\n"
+                    f"La diapositiva ha sido marcada como generada por IA."
+                )
+            else:
+                error_data = response.json()
+                await query.edit_message_text(
+                    f"❌ Error al generar diapositiva:\n{error_data.get('error', 'Error desconocido')}"
+                )
+
+        except Exception as e:
+            await query.edit_message_text(f"❌ Error: {str(e)}")
+
+    # Regenerar opciones
+    elif callback_data == 'example_regenerate':
+        try:
+            await query.edit_message_text("⏳ Generando nuevas opciones...")
+
+            response = requests.post(f"{API_BASE_URL}/example/{request_id}/regenerate")
+
+            if response.status_code == 200:
+                data = response.json()
+                new_options = data.get('options', [])
+                topic = req_data['topic']
+
+                # Actualizar solicitud
+                req_data['options'] = new_options
+
+                # Crear teclado con nuevas opciones
+                keyboard = []
+                for i, option in enumerate(new_options):
+                    keyboard.append([InlineKeyboardButton(f"Opción {i+1}", callback_data=f"example_select_{i}")])
+
+                keyboard.append([InlineKeyboardButton("🔄 Más opciones", callback_data="example_regenerate")])
+                keyboard.append([InlineKeyboardButton("❌ Cancelar", callback_data="example_cancel")])
+
+                reply_markup = InlineKeyboardMarkup(keyboard)
+
+                # Mostrar nuevas opciones
+                options_text = f"🤖 Nuevas opciones generadas sobre: {topic}\n\n"
+                for i, option in enumerate(new_options):
+                    options_text += f"📝 Opción {i+1}:\n{option[:200]}{'...' if len(option) > 200 else ''}\n\n"
+
+                await query.edit_message_text(
+                    options_text,
+                    reply_markup=reply_markup
+                )
+            else:
+                await query.edit_message_text("❌ Error al regenerar opciones")
+
+        except Exception as e:
+            await query.edit_message_text(f"❌ Error: {str(e)}")
+
+    # Cancelar solicitud
+    elif callback_data == 'example_cancel':
+        try:
+            requests.post(f"{API_BASE_URL}/example/{request_id}/cancel")
+            del pending_example_requests[chat_id]
+            await query.edit_message_text("❌ Solicitud de ejemplo cancelada.")
+        except Exception as e:
+            await query.edit_message_text(f"❌ Error: {str(e)}")
+
+
+async def example_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /ejemplo TEMA - Solicita generar ejemplos con IA"""
+    chat_id = update.effective_chat.id
+
+    if chat_id not in user_sessions:
+        await update.message.reply_text(
+            "❌ No estás sincronizado.\n"
+            "Usa /sync CODIGO para conectar primero."
+        )
+        return
+
+    # Verificar que la instancia esté activa
+    sync_code = user_sessions[chat_id]
+    status_response = requests.get(f"{API_BASE_URL}/sync/{sync_code}/status")
+
+    if status_response.status_code == 200:
+        status_data = status_response.json()
+        if not status_data.get('is_instance_active', False):
+            await update.message.reply_text(
+                "❌ La clase ya finalizó.\n\n"
+                "No se pueden generar más ejemplos después de finalizar la clase."
+            )
+            return
+    else:
+        await update.message.reply_text("❌ Error al verificar estado de la sesión")
+        return
+
+    # Verificar que se proporcionó el tema
+    if not context.args or len(context.args) == 0:
+        await update.message.reply_text(
+            "❌ Uso incorrecto.\n\n"
+            "Formato: /ejemplo TEMA\n"
+            "Ejemplo: /ejemplo ecuaciones cuadráticas"
+        )
+        return
+
+    topic = ' '.join(context.args)
+
+    try:
+        # Solicitar generación de ejemplos al backend
+        response = requests.post(
+            f"{API_BASE_URL}/sync/{sync_code}/example/request",
+            json={'topic': topic}
+        )
+
+        if response.status_code == 200:
+            data = response.json()
+            request_id = data.get('request_id')
+            options = data.get('options', [])
+
+            # Guardar solicitud pendiente
+            pending_example_requests[chat_id] = {
+                'request_id': request_id,
+                'options': options,
+                'topic': topic
+            }
+
+            # Crear teclado con opciones
+            keyboard = []
+            for i, option in enumerate(options):
+                # Truncar texto para el botón
+                button_text = option[:50] + "..." if len(option) > 50 else option
+                keyboard.append([InlineKeyboardButton(f"Opción {i+1}", callback_data=f"example_select_{i}")])
+
+            keyboard.append([InlineKeyboardButton("🔄 Más opciones", callback_data="example_regenerate")])
+            keyboard.append([InlineKeyboardButton("❌ Cancelar", callback_data="example_cancel")])
+
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            # Mostrar opciones
+            options_text = f"🤖 Ejemplos generados sobre: {topic}\n\n"
+            for i, option in enumerate(options):
+                options_text += f"📝 Opción {i+1}:\n{option[:200]}{'...' if len(option) > 200 else ''}\n\n"
+
+            await update.message.reply_text(
+                options_text,
+                reply_markup=reply_markup
+            )
+
+        elif response.status_code == 400:
+            error_data = response.json()
+            await update.message.reply_text(f"❌ {error_data.get('error', 'Error desconocido')}")
+        else:
+            await update.message.reply_text("❌ Error al generar ejemplos")
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
+
+async def handle_question_callback(query, chat_id: int, callback_data: str):
+    """Maneja las interacciones con los botones de preguntas"""
+    if chat_id not in pending_question_requests:
+        await query.edit_message_text("❌ Solicitud expirada. Usa /pregunta nuevamente.")
+        return
+
+    req_data = pending_question_requests[chat_id]
+    request_id = req_data['request_id']
+    question_type = req_data['question_type']
+
+    # Seleccionar tipo de pregunta
+    if callback_data in ['question_type_multiple', 'question_type_open']:
+        selected_type = 'multiple-choice' if 'multiple' in callback_data else 'open'
+
+        try:
+            await query.edit_message_text("⏳ Generando preguntas basadas en el contenido...")
+
+            sync_code = user_sessions[chat_id]
+
+            # Solicitar generación de preguntas al backend
+            response = requests.post(
+                f"{API_BASE_URL}/sync/{sync_code}/question/request",
+                json={'question_type': selected_type}
+            )
+
+            if response.status_code == 200:
+                data = response.json()
+                new_request_id = data.get('request_id')
+                options = data.get('options', [])
+
+                # Actualizar solicitud pendiente
+                req_data['request_id'] = new_request_id
+                req_data['options'] = options
+                req_data['question_type'] = selected_type
+
+                # Crear teclado con opciones
+                keyboard = []
+                for i, option in enumerate(options):
+                    keyboard.append([InlineKeyboardButton(f"Opción {i+1}", callback_data=f"question_select_{i}")])
+
+                keyboard.append([InlineKeyboardButton("🔄 Más opciones", callback_data="question_regenerate")])
+                keyboard.append([InlineKeyboardButton("❌ Cancelar", callback_data="question_cancel")])
+
+                reply_markup = InlineKeyboardMarkup(keyboard)
+
+                # Mostrar opciones
+                type_label = "con alternativas" if selected_type == "multiple-choice" else "abierta"
+                options_text = f"🤖 Preguntas generadas (tipo: {type_label}):\n\n"
+                for i, option in enumerate(options):
+                    options_text += f"📝 Opción {i+1}:\n{option[:300]}{'...' if len(option) > 300 else ''}\n\n"
+
+                await query.edit_message_text(
+                    options_text,
+                    reply_markup=reply_markup
+                )
+            else:
+                await query.edit_message_text("❌ Error al generar preguntas")
+
+        except Exception as e:
+            await query.edit_message_text(f"❌ Error: {str(e)}")
+        return
+
+    # Seleccionar una opción de pregunta
+    if callback_data.startswith('question_select_'):
+        option_index = int(callback_data.split('_')[2])
+
+        try:
+            await query.edit_message_text("⏳ Generando diapositiva con la pregunta seleccionada...")
+
+            # Enviar selección al backend
+            response = requests.post(
+                f"{API_BASE_URL}/question/{request_id}/select",
+                json={'option_index': option_index}
+            )
+
+            if response.status_code == 200:
+                data = response.json()
+                new_slide_index = data.get('new_slide_index')
+                total_slides = data.get('total_slides')
+
+                # Eliminar solicitud pendiente
+                del pending_question_requests[chat_id]
+
+                await query.edit_message_text(
+                    f"✅ ¡Pregunta generada exitosamente!\n\n"
+                    f"📊 Nueva diapositiva creada en posición {new_slide_index}\n"
+                    f"Total de diapositivas: {total_slides}\n\n"
+                    f"La diapositiva ha sido marcada como generada por IA."
+                )
+            else:
+                error_data = response.json()
+                await query.edit_message_text(
+                    f"❌ Error al generar diapositiva:\n{error_data.get('error', 'Error desconocido')}"
+                )
+
+        except Exception as e:
+            await query.edit_message_text(f"❌ Error: {str(e)}")
+
+    # Regenerar opciones
+    elif callback_data == 'question_regenerate':
+        try:
+            await query.edit_message_text("⏳ Generando nuevas opciones...")
+
+            response = requests.post(f"{API_BASE_URL}/question/{request_id}/regenerate")
+
+            if response.status_code == 200:
+                data = response.json()
+                new_options = data.get('options', [])
+                question_type = req_data['question_type']
+
+                # Actualizar solicitud
+                req_data['options'] = new_options
+
+                # Crear teclado con nuevas opciones
+                keyboard = []
+                for i, option in enumerate(new_options):
+                    keyboard.append([InlineKeyboardButton(f"Opción {i+1}", callback_data=f"question_select_{i}")])
+
+                keyboard.append([InlineKeyboardButton("🔄 Más opciones", callback_data="question_regenerate")])
+                keyboard.append([InlineKeyboardButton("❌ Cancelar", callback_data="question_cancel")])
+
+                reply_markup = InlineKeyboardMarkup(keyboard)
+
+                # Mostrar nuevas opciones
+                type_label = "con alternativas" if question_type == "multiple-choice" else "abierta"
+                options_text = f"🤖 Nuevas preguntas generadas (tipo: {type_label}):\n\n"
+                for i, option in enumerate(new_options):
+                    options_text += f"📝 Opción {i+1}:\n{option[:300]}{'...' if len(option) > 300 else ''}\n\n"
+
+                await query.edit_message_text(
+                    options_text,
+                    reply_markup=reply_markup
+                )
+            else:
+                await query.edit_message_text("❌ Error al regenerar opciones")
+
+        except Exception as e:
+            await query.edit_message_text(f"❌ Error: {str(e)}")
+
+    # Cancelar solicitud
+    elif callback_data == 'question_cancel':
+        try:
+            requests.post(f"{API_BASE_URL}/question/{request_id}/cancel")
+            del pending_question_requests[chat_id]
+            await query.edit_message_text("❌ Solicitud de pregunta cancelada.")
+        except Exception as e:
+            await query.edit_message_text(f"❌ Error: {str(e)}")
+
+
+async def question_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /pregunta - Solicita generar preguntas con IA (solo texto)"""
+    chat_id = update.effective_chat.id
+
+    if chat_id not in user_sessions:
+        await update.message.reply_text(
+            "❌ No estás sincronizado.\n"
+            "Usa /sync CODIGO para conectar primero."
+        )
+        return
+
+    # Verificar que la instancia esté activa
+    sync_code = user_sessions[chat_id]
+    status_response = requests.get(f"{API_BASE_URL}/sync/{sync_code}/status")
+
+    if status_response.status_code == 200:
+        status_data = status_response.json()
+        if not status_data.get('is_instance_active', False):
+            await update.message.reply_text(
+                "❌ La clase ya finalizó.\n\n"
+                "No se pueden generar más preguntas después de finalizar la clase."
+            )
+            return
+    else:
+        await update.message.reply_text("❌ Error al verificar estado de la sesión")
+        return
+
+    # Crear teclado para elegir tipo de pregunta
+    keyboard = [
+        [InlineKeyboardButton("📝 Con alternativas (A, B, C, D)", callback_data="question_type_multiple")],
+        [InlineKeyboardButton("✍️ Abierta (desarrollo)", callback_data="question_type_open")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    # Guardar solicitud inicial (sin request_id aún)
+    pending_question_requests[chat_id] = {
+        'request_id': None,
+        'options': [],
+        'question_type': None
+    }
+
+    await update.message.reply_text(
+        "🤖 Generación de Pregunta con IA\n\n"
+        "Selecciona el tipo de pregunta que deseas generar:\n\n"
+        "📝 Con alternativas: pregunta de opción múltiple (4 alternativas)\n"
+        "✍️ Abierta: pregunta de desarrollo\n\n"
+        "La pregunta se generará basada en el contenido de las diapositivas hasta la actual.",
+        reply_markup=reply_markup
+    )
+
+
+async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Maneja mensajes de voz para generar ejemplos"""
+    chat_id = update.effective_chat.id
+
+    if chat_id not in user_sessions:
+        await update.message.reply_text(
+            "❌ No estás sincronizado.\n"
+            "Usa /sync CODIGO para conectar primero."
+        )
+        return
+
+    # Verificar que la instancia esté activa
+    sync_code = user_sessions[chat_id]
+    status_response = requests.get(f"{API_BASE_URL}/sync/{sync_code}/status")
+
+    if status_response.status_code == 200:
+        status_data = status_response.json()
+        if not status_data.get('is_instance_active', False):
+            await update.message.reply_text(
+                "❌ La clase ya finalizó.\n\n"
+                "No se pueden generar más ejemplos después de finalizar la clase."
+            )
+            return
+    else:
+        await update.message.reply_text("❌ Error al verificar estado de la sesión")
+        return
+
+    try:
+        # Obtener el archivo de voz
+        voice = update.message.voice
+        voice_file = await context.bot.get_file(voice.file_id)
+
+        # Descargar el archivo de audio
+        audio_path = f"/tmp/voice_{chat_id}_{voice.file_id}.ogg"
+        await voice_file.download_to_drive(audio_path)
+
+        await update.message.reply_text("🎤 Audio recibido. Transcribiendo...")
+
+        # Importar librería para transcripción
+        try:
+            from google import genai
+            import os
+            import base64
+
+            GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+            client = genai.Client(api_key=GEMINI_API_KEY)
+
+            # Leer archivo de audio y codificar en base64
+            with open(audio_path, 'rb') as audio_file:
+                audio_data = base64.b64encode(audio_file.read()).decode('utf-8')
+
+            # Transcribir con Gemini
+            response = client.models.generate_content(
+                model="gemini-2.0-flash-lite",
+                contents=[
+                    {
+                        "parts": [
+                            {"text": "Transcribe este audio a texto. Responde SOLO con la transcripción, sin agregar nada más."},
+                            {"inline_data": {"mime_type": "audio/ogg", "data": audio_data}}
+                        ]
+                    }
+                ]
+            )
+
+            transcript = response.text.strip()
+
+            # Eliminar archivo temporal
+            os.remove(audio_path)
+
+            await update.message.reply_text(f"📝 Transcripción: {transcript}\n\n⏳ Generando ejemplos...")
+
+            # Usar el texto transcrito como tema para generar ejemplos
+            sync_code = user_sessions[chat_id]
+
+            response = requests.post(
+                f"{API_BASE_URL}/sync/{sync_code}/example/request",
+                json={'topic': transcript}
+            )
+
+            if response.status_code == 200:
+                data = response.json()
+                request_id = data.get('request_id')
+                options = data.get('options', [])
+
+                # Guardar solicitud pendiente
+                pending_example_requests[chat_id] = {
+                    'request_id': request_id,
+                    'options': options,
+                    'topic': transcript
+                }
+
+                # Crear teclado con opciones
+                keyboard = []
+                for i, option in enumerate(options):
+                    keyboard.append([InlineKeyboardButton(f"Opción {i+1}", callback_data=f"example_select_{i}")])
+
+                keyboard.append([InlineKeyboardButton("🔄 Más opciones", callback_data="example_regenerate")])
+                keyboard.append([InlineKeyboardButton("❌ Cancelar", callback_data="example_cancel")])
+
+                reply_markup = InlineKeyboardMarkup(keyboard)
+
+                # Mostrar opciones
+                options_text = f"🤖 Ejemplos generados sobre: {transcript}\n\n"
+                for i, option in enumerate(options):
+                    options_text += f"📝 Opción {i+1}:\n{option[:200]}{'...' if len(option) > 200 else ''}\n\n"
+
+                await update.message.reply_text(
+                    options_text,
+                    reply_markup=reply_markup
+                )
+            else:
+                await update.message.reply_text("❌ Error al generar ejemplos")
+
+        except ImportError:
+            await update.message.reply_text(
+                "❌ Error: No se puede procesar audio. Falta configuración de Gemini AI."
+            )
+        except Exception as transcribe_error:
+            await update.message.reply_text(
+                f"❌ Error al transcribir audio: {str(transcribe_error)}"
+            )
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error al procesar audio: {str(e)}")
+
+
+def setup_bot_application():
+    """Configura la aplicación del bot con todos los handlers"""
+    if not BOT_TOKEN:
+        print("❌ ERROR: TELEGRAM_BOT_TOKEN no configurado en .env")
+        return None
+
+    # Crear aplicación
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    # Registrar handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("sync", sync_command))
+    application.add_handler(CommandHandler("disconnect", disconnect_command))
+    application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(CommandHandler("ejemplo", example_command))
+    application.add_handler(CommandHandler("pregunta", question_command))
+    application.add_handler(MessageHandler(filters.VOICE, handle_voice_message))
+    application.add_handler(CallbackQueryHandler(button_callback))
+
+    return application
+
+
+def run_bot_polling():
+    """
+    MODO POLLING (Solo para desarrollo/testing local)
+    NO usar en producción - requiere proceso 24/7
+    """
+    application = setup_bot_application()
+    if not application:
+        return
+
+    print("🤖 Bot de Telegram iniciado en modo POLLING (desarrollo)...")
+    print("⚠️  ADVERTENCIA: Este modo NO es apropiado para producción")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == '__main__':
+    # Solo para testing local
+    run_bot_polling()
